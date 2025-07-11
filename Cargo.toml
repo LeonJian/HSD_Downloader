@@ -1,0 +1,8 @@
+[package]
+name = "Himawari_HSD_downloader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ssh2 = "0.9.5"
+chrono = "0.4.41"
