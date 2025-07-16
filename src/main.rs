@@ -8,6 +8,5 @@ fn main() {
     );
 
     let download_time_list = get_download_time_list();
-
     println!("Download Time List: {:?}", download_time_list);
 }

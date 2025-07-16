@@ -1,12 +1,10 @@
-static DATE_FMT: &str = r#"%Y-%m-%d %H:%M:%S"#;
-static TIME_STEP: i64 = 10;
-
 pub mod get_download_time_list {
-    use crate::get_download_time_list::{DATE_FMT, TIME_STEP};
     use chrono::{Duration, NaiveDateTime, Timelike, Utc};
     use std::fmt::Formatter;
     use std::{fmt, io};
 
+    const DATE_FMT: &str = r#"%Y-%m-%d %H:%M:%S"#;
+    const TIME_STEP: i64 = 10;
     pub fn get_download_time_list() -> Vec<NaiveDateTime> {
         let current_time = Utc::now();
         println!(
