@@ -1,6 +1,6 @@
 # Himawari HSD Data Downloader
 
-一个用于下载Himawari卫星HSD（Himawari Standard Data）数据的多线程Rust工具。该工具支持高效的批量下载、断点续传、数据完整性检查和智能文件组织。
+一个用于下载Himawari卫星HSD（Himawari Standard Data）数据的多线程Rust工具。该工具支持高效的批量下载、数据完整性检查和智能文件组织。
 
 ## 目录
 
