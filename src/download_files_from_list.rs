@@ -8,23 +8,11 @@ pub mod download_files {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    // Himawari 9 频段定义
-    const HIMAWARI_BANDS: [&str; 16] = [
-        "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09", "B10", "B11", "B12", "B13",
-        "B14", "B15", "B16",
-    ];
-
-    // 每个波段的10个分段文件标识符
-    const SEGMENT_IDS: [&str; 10] = [
-        "S0110", "S0210", "S0310", "S0410", "S0510", "S0610", "S0710", "S0810", "S0910", "S1010",
-    ];
-
     /// 本地文件存储结构
     #[derive(Debug, Clone)]
     pub struct LocalFileStorage {
         pub base_path: PathBuf,
-        pub organize_by_time: bool, // true: 按时间组织，false: 按波段组织
-        pub keep_original_structure: bool, // 是否保持原始目录结构
+        pub organize_by_time: bool,
     }
 
     impl LocalFileStorage {
@@ -32,7 +20,6 @@ pub mod download_files {
             Self {
                 base_path: PathBuf::from(base_path),
                 organize_by_time: true,
-                keep_original_structure: false,
             }
         }
 
@@ -41,70 +28,34 @@ pub mod download_files {
             self
         }
 
-        pub fn with_original_structure(mut self, keep_original: bool) -> Self {
-            self.keep_original_structure = keep_original;
-            self
-        }
-
-        /// 根据远程文件路径生成本地文件路径
+        /// 生成本地文件路径
         pub fn generate_local_path(&self, remote_path: &str) -> PathBuf {
-            if self.keep_original_structure {
-                // 保持原始目录结构
-                let relative_path = remote_path.trim_start_matches('/');
-                self.base_path.join(relative_path)
-            } else {
-                // 自定义组织结构
-                let filename = Path::new(remote_path)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy();
+            let filename = Path::new(remote_path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy();
 
-                if self.organize_by_time {
-                    // 按时间组织: base_path/YYYY/MM/DD/HH/filename
-                    self.extract_time_path_from_filename(&filename)
-                } else {
-                    // 按波段组织: base_path/BXX/YYYY/MM/DD/HH/filename
-                    self.extract_band_path_from_filename(&filename)
+            if self.organize_by_time {
+                if let Some(parts) = self.parse_filename(&filename) {
+                    return self
+                        .base_path
+                        .join(&parts.year)
+                        .join(&parts.month)
+                        .join(&parts.day)
+                        .join(&parts.hour)
+                        .join(filename.as_ref());
                 }
             }
-        }
 
-        fn extract_time_path_from_filename(&self, filename: &str) -> PathBuf {
-            // 解析文件名: HS_H09_20250717_0900_B01_FLDK_R10_S0110.DAT.bz2
-            if let Some(parts) = self.parse_filename(filename) {
-                self.base_path
-                    .join(&parts.year)
-                    .join(&parts.month)
-                    .join(&parts.day)
-                    .join(&parts.hour)
-                    .join(filename)
-            } else {
-                // 如果解析失败，放在根目录
-                self.base_path.join(filename)
-            }
-        }
-
-        fn extract_band_path_from_filename(&self, filename: &str) -> PathBuf {
-            if let Some(parts) = self.parse_filename(filename) {
-                self.base_path
-                    .join(&parts.band)
-                    .join(&parts.year)
-                    .join(&parts.month)
-                    .join(&parts.day)
-                    .join(&parts.hour)
-                    .join(filename)
-            } else {
-                self.base_path.join(filename)
-            }
+            self.base_path.join(filename.as_ref())
         }
 
         fn parse_filename(&self, filename: &str) -> Option<FilenameParts> {
-            // HS_H09_20250717_0900_B01_FLDK_R10_S0110.DAT.bz2
+            // HS_H09_20250717_0900_B03_FLDK_R05_S0101.DAT.bz2
             let parts: Vec<&str> = filename.split('_').collect();
-            if parts.len() >= 5 {
+            if parts.len() >= 4 {
                 let datetime_str = parts[2];
                 let time_str = parts[3];
-                let band = parts[4];
 
                 if datetime_str.len() == 8 && time_str.len() == 4 {
                     return Some(FilenameParts {
@@ -112,7 +63,6 @@ pub mod download_files {
                         month: datetime_str[4..6].to_string(),
                         day: datetime_str[6..8].to_string(),
                         hour: time_str[0..2].to_string(),
-                        band: band.to_string(),
                     });
                 }
             }
@@ -126,7 +76,6 @@ pub mod download_files {
         month: String,
         day: String,
         hour: String,
-        band: String,
     }
 
     /// 下载统计信息
@@ -149,47 +98,75 @@ pub mod download_files {
         }
     }
 
-    fn distribute_download_to_threads(
-        download_list: Vec<NaiveDateTime>,
-        num_threads: usize,
-    ) -> Result<Vec<Vec<NaiveDateTime>>, Box<dyn std::error::Error>> {
-        if num_threads == 0 {
-            Err("Number of threads must be greater than 0")?;
-        }
-
-        let mut result: Vec<Vec<NaiveDateTime>> = vec![Vec::new(); num_threads];
-
-        for (i, time) in download_list.into_iter().enumerate() {
-            let thread_index = i % num_threads;
-            result[thread_index].push(time);
-        }
-        Ok(result)
-    }
-
-    /// 流式下载单个文件并立即写入磁盘
+    /// 先下载到内存，确认完毕后再保存到磁盘
     fn download_and_save_file(
         sftp: &ssh2::Sftp,
         remote_path: &str,
         local_storage: &LocalFileStorage,
-    ) -> Result<(String, u64), Box<dyn std::error::Error>> {
+    ) -> Result<u64, Box<dyn std::error::Error>> {
         println!("正在下载: {}", remote_path);
 
-        // 生成本地文件路径
         let local_path = local_storage.generate_local_path(remote_path);
 
-        // 确保目录存在
+        // 检查文件是否已经存在
+        if local_path.exists() {
+            println!("文件已存在，跳过: {}", local_path.display());
+            return Ok(0);
+        }
+
+        // 第一步：先下载到内存
+        let mut remote_file = sftp.open(Path::new(remote_path))?;
+        let mut buffer = Vec::new();
+
+        // 读取整个文件到内存
+        remote_file.read_to_end(&mut buffer)?;
+        let total_bytes = buffer.len() as u64;
+
+        println!(
+            "文件已完全下载到内存: {} ({} 字节)",
+            remote_path, total_bytes
+        );
+
+        // 第二步：确认下载完毕后，创建目录并保存到磁盘
         if let Some(parent) = local_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        // 打开远程文件
-        let mut remote_file = sftp.open(Path::new(remote_path))?;
+        // 一次性写入磁盘
+        let mut local_file = File::create(&local_path)?;
+        local_file.write_all(&buffer)?;
+        local_file.flush()?;
 
-        // 创建本地文件
+        println!("完成保存: {} ({} 字节)", local_path.display(), total_bytes);
+
+        Ok(total_bytes)
+    }
+
+    /// 流式下载版本（可选用）- 边下载边写入磁盘
+    #[allow(dead_code)]
+    fn download_and_save_file_streaming(
+        sftp: &ssh2::Sftp,
+        remote_path: &str,
+        local_storage: &LocalFileStorage,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        println!("正在流式下载: {}", remote_path);
+
+        let local_path = local_storage.generate_local_path(remote_path);
+
+        // 检查文件是否已经存在
+        if local_path.exists() {
+            println!("文件已存在，跳过: {}", local_path.display());
+            return Ok(0);
+        }
+
+        if let Some(parent) = local_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut remote_file = sftp.open(Path::new(remote_path))?;
         let mut local_file = File::create(&local_path)?;
 
-        // 流式传输数据
-        let mut buffer = [0; 8192]; // 8KB缓冲区
+        let mut buffer = [0; 8192];
         let mut total_bytes = 0u64;
 
         loop {
@@ -205,85 +182,98 @@ pub mod download_files {
         local_file.flush()?;
 
         println!(
-            "完成下载: {} -> {} ({} 字节)",
-            remote_path,
+            "完成流式下载: {} ({} 字节)",
             local_path.display(),
             total_bytes
         );
 
-        Ok((local_path.to_string_lossy().to_string(), total_bytes))
+        Ok(total_bytes)
     }
 
-    /// 流式下载多个文件
-    fn download_files_streaming(
+    /// 读取远程目录并筛选FLDK文件
+    fn list_fldk_files_in_directory(
+        sftp: &ssh2::Sftp,
+        remote_dir: &str,
+        target_time: &NaiveDateTime,
+        bands: &[String],
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut fldk_files = Vec::new();
+
+        // 读取目录内容
+        let dir_entries = sftp.readdir(Path::new(remote_dir))?;
+
+        let target_datetime_str = target_time.format("%Y%m%d_%H%M").to_string();
+
+        for (path, _stat) in dir_entries {
+            if let Some(filename) = path.file_name() {
+                let filename_str = filename.to_string_lossy();
+
+                // 筛选FLDK文件
+                if filename_str.contains("FLDK")
+                    && filename_str.contains(&target_datetime_str)
+                    && filename_str.ends_with(".DAT.bz2")
+                {
+                    // 检查是否包含所需波段
+                    if bands.is_empty() || bands.iter().any(|band| filename_str.contains(band)) {
+                        fldk_files.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(fldk_files)
+    }
+
+    /// 获取指定时间的远程目录路径
+    fn get_remote_directory_path(datetime: &NaiveDateTime) -> String {
+        format!(
+            "/jma/hsd/{}/{}/{}/",
+            datetime.format("%Y%m"), // 202507
+            datetime.format("%d"),   // 17
+            datetime.format("%H")
+        ) // 09
+    }
+
+    /// 收集所有要下载的文件列表
+    fn collect_all_files(
+        download_list: &[NaiveDateTime],
+        bands: &[String],
         host: &str,
         username: &str,
         password: &str,
-        remote_file_paths: Vec<String>,
-        local_storage: &LocalFileStorage,
-    ) -> Result<DownloadStats, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        println!("开始收集所有需要下载的文件列表...");
+
+        // 建立连接
         let tcp = TcpStream::connect(host)?;
-        let mut sess = Session::new()?;
+        let mut sess = Session::new().unwrap();
         sess.set_tcp_stream(tcp);
         sess.handshake()?;
         sess.userauth_password(username, password)?;
         let sftp = sess.sftp()?;
 
-        let mut stats = DownloadStats::new();
-        stats.total_files = remote_file_paths.len();
+        let mut all_files = Vec::new();
 
-        for remote_path in remote_file_paths {
-            match download_and_save_file(&sftp, &remote_path, local_storage) {
-                Ok((local_path, bytes)) => {
-                    stats.downloaded_files += 1;
-                    stats.total_bytes += bytes;
+        for datetime in download_list {
+            let remote_dir = get_remote_directory_path(datetime);
+
+            match list_fldk_files_in_directory(&sftp, &remote_dir, datetime, bands) {
+                Ok(files) => {
+                    println!("在 {} 找到 {} 个文件", remote_dir, files.len());
+                    all_files.extend(files);
                 }
                 Err(e) => {
-                    eprintln!("下载失败 {}: {}", remote_path, e);
-                    stats.failed_files += 1;
+                    eprintln!("读取目录失败 {}: {}", remote_dir, e);
                 }
             }
         }
 
-        Ok(stats)
+        println!("总共收集到 {} 个文件待下载", all_files.len());
+        Ok(all_files)
     }
 
-    /// 为指定波段和时间生成所有10个分段文件的路径
-    fn generate_band_segment_paths(datetime: &NaiveDateTime, band: &str) -> Vec<String> {
-        let mut file_paths = Vec::new();
-
-        let year = datetime.format("%Y").to_string();
-        let month = datetime.format("%m").to_string();
-        let day = datetime.format("%d").to_string();
-        let hour = datetime.format("%H").to_string();
-        let datetime_str = datetime.format("%Y%m%d_%H%M").to_string();
-
-        for segment_id in SEGMENT_IDS.iter() {
-            let filename = format!(
-                "HS_H09_{}_{}_FLDK_R10_{}.DAT.bz2",
-                datetime_str, band, segment_id
-            );
-            let full_path = format!("/jma/hsd/{}/{}/{}/{}/{}", year, month, day, hour, filename);
-            file_paths.push(full_path);
-        }
-
-        file_paths
-    }
-
-    /// 为指定时间和波段列表生成所有文件路径
-    fn generate_himawari_file_paths(datetime: &NaiveDateTime, bands: &[String]) -> Vec<String> {
-        let mut all_file_paths = Vec::new();
-
-        for band in bands {
-            let band_paths = generate_band_segment_paths(datetime, band);
-            all_file_paths.extend(band_paths);
-        }
-
-        all_file_paths
-    }
-
-    /// 多线程流式下载Himawari文件
-    pub fn download_himawari_files_streaming_multi_thread(
+    /// 多线程流式下载FLDK文件 - 优化版
+    pub fn download_fldk_files_streaming(
         download_list: Vec<NaiveDateTime>,
         bands: Vec<String>,
         num_threads: usize,
@@ -297,35 +287,41 @@ pub mod download_files {
             return Ok(DownloadStats::new());
         }
 
-        if bands.is_empty() {
-            println!("未指定波段，跳过下载");
+        if !bands.is_empty() {
+            println!("筛选波段: {:?}", bands);
+        } else {
+            println!("下载所有FLDK文件");
+        }
+
+        println!("准备下载 {} 个时间点的FLDK数据", download_list.len());
+
+        // 第一步：收集所有要下载的文件
+        let all_files = collect_all_files(&download_list, &bands, host, username, password)?;
+
+        if all_files.is_empty() {
+            println!("没有找到符合条件的文件");
             return Ok(DownloadStats::new());
         }
 
-        // 验证波段
-        for band in &bands {
-            if !HIMAWARI_BANDS.contains(&band.as_str()) {
-                return Err(format!("无效的波段: {}", band).into());
+        // 第二步：将文件分配给线程
+        let files_per_thread = (all_files.len() + num_threads - 1) / num_threads;
+        let mut distributed_files = Vec::new();
+
+        for i in 0..num_threads {
+            let start = i * files_per_thread;
+            let end = ((i + 1) * files_per_thread).min(all_files.len());
+            if start < all_files.len() {
+                distributed_files.push(all_files[start..end].to_vec());
             }
         }
-
-        println!(
-            "准备下载 {} 个时间点，{} 个波段，每个波段10个文件",
-            download_list.len(),
-            bands.len()
-        );
-
-        // 分配任务到线程
-        let distributed_tasks = distribute_download_to_threads(download_list, num_threads)?;
 
         // 创建共享统计信息
         let total_stats = Arc::new(Mutex::new(DownloadStats::new()));
         let mut handles = Vec::new();
 
         // 为每个线程创建任务
-        for (thread_id, task_list) in distributed_tasks.into_iter().enumerate() {
-            if task_list.is_empty() {
-                println!("线程 {} 没有任务，跳过", thread_id);
+        for (thread_id, file_list) in distributed_files.into_iter().enumerate() {
+            if file_list.is_empty() {
                 continue;
             }
 
@@ -333,49 +329,72 @@ pub mod download_files {
             let host = host.to_string();
             let username = username.to_string();
             let password = password.to_string();
-            let bands_clone = bands.clone();
             let storage_clone = local_storage.clone();
 
             let handle = thread::spawn(move || {
-                println!("线程 {} 开始处理 {} 个时间点", thread_id, task_list.len());
+                println!("线程 {} 开始处理 {} 个文件", thread_id, file_list.len());
 
-                // 为当前线程的所有时间点和波段生成文件路径
-                let mut all_file_paths = Vec::new();
-                for datetime in &task_list {
-                    let file_paths = generate_himawari_file_paths(datetime, &bands_clone);
-                    all_file_paths.extend(file_paths);
-                }
-
-                println!("线程 {} 将下载 {} 个文件", thread_id, all_file_paths.len());
-
-                // 流式下载文件
-                match download_files_streaming(
-                    &host,
-                    &username,
-                    &password,
-                    all_file_paths,
-                    &storage_clone,
-                ) {
-                    Ok(thread_stats) => {
-                        println!(
-                            "线程 {} 完成，成功: {}, 失败: {}, 总字节: {}",
-                            thread_id,
-                            thread_stats.downloaded_files,
-                            thread_stats.failed_files,
-                            thread_stats.total_bytes
-                        );
-
-                        // 合并统计信息
-                        let mut total_stats = stats_clone.lock().unwrap();
-                        total_stats.total_files += thread_stats.total_files;
-                        total_stats.downloaded_files += thread_stats.downloaded_files;
-                        total_stats.failed_files += thread_stats.failed_files;
-                        total_stats.total_bytes += thread_stats.total_bytes;
-                    }
+                // 建立连接
+                let tcp = match TcpStream::connect(&host) {
+                    Ok(tcp) => tcp,
                     Err(e) => {
-                        eprintln!("线程 {} 下载失败: {}", thread_id, e);
+                        eprintln!("线程 {} 连接失败: {}", thread_id, e);
+                        return;
+                    }
+                };
+
+                let mut sess = Session::new().unwrap();
+                sess.set_tcp_stream(tcp);
+
+                if let Err(e) = sess.handshake() {
+                    eprintln!("线程 {} 握手失败: {}", thread_id, e);
+                    return;
+                }
+
+                if let Err(e) = sess.userauth_password(&username, &password) {
+                    eprintln!("线程 {} 认证失败: {}", thread_id, e);
+                    return;
+                }
+
+                let sftp = match sess.sftp() {
+                    Ok(sftp) => sftp,
+                    Err(e) => {
+                        eprintln!("线程 {} SFTP初始化失败: {}", thread_id, e);
+                        return;
+                    }
+                };
+
+                let mut thread_stats = DownloadStats::new();
+                thread_stats.total_files = file_list.len();
+
+                // 下载分配给该线程的所有文件
+                for file_path in file_list {
+                    match download_and_save_file(&sftp, &file_path, &storage_clone) {
+                        Ok(bytes) => {
+                            thread_stats.downloaded_files += 1;
+                            thread_stats.total_bytes += bytes;
+                        }
+                        Err(e) => {
+                            eprintln!("线程 {} 下载失败 {}: {}", thread_id, file_path, e);
+                            thread_stats.failed_files += 1;
+                        }
                     }
                 }
+
+                println!(
+                    "线程 {} 完成，成功: {}, 失败: {}, 总字节: {}",
+                    thread_id,
+                    thread_stats.downloaded_files,
+                    thread_stats.failed_files,
+                    thread_stats.total_bytes
+                );
+
+                // 合并统计信息
+                let mut total_stats = stats_clone.lock().unwrap();
+                total_stats.total_files += thread_stats.total_files;
+                total_stats.downloaded_files += thread_stats.downloaded_files;
+                total_stats.failed_files += thread_stats.failed_files;
+                total_stats.total_bytes += thread_stats.total_bytes;
             });
 
             handles.push(handle);
@@ -388,53 +407,18 @@ pub mod download_files {
                 .map_err(|e| format!("线程加入失败: {:?}", e))?;
         }
 
-        // 返回统计结果
         let final_stats = Arc::try_unwrap(total_stats).unwrap().into_inner().unwrap();
+
+        println!("下载完成统计:");
+        println!("  总文件数: {}", final_stats.total_files);
+        println!("  成功下载: {}", final_stats.downloaded_files);
+        println!("  失败文件: {}", final_stats.failed_files);
+        println!("  总字节数: {}", final_stats.total_bytes);
+
         Ok(final_stats)
     }
 
-    /// 便捷函数：下载所有波段
-    pub fn download_all_bands_streaming(
-        download_list: Vec<NaiveDateTime>,
-        num_threads: usize,
-        host: &str,
-        username: &str,
-        password: &str,
-        local_storage: LocalFileStorage,
-    ) -> Result<DownloadStats, Box<dyn std::error::Error>> {
-        download_himawari_files_streaming_multi_thread(
-            download_list,
-            HIMAWARI_BANDS.iter().map(|s| s.to_string()).collect(),
-            num_threads,
-            host,
-            username,
-            password,
-            local_storage,
-        )
-    }
-
-    /// 便捷函数：下载单个波段
-    pub fn download_single_band_streaming(
-        download_list: Vec<NaiveDateTime>,
-        band: &str,
-        num_threads: usize,
-        host: &str,
-        username: &str,
-        password: &str,
-        local_storage: LocalFileStorage,
-    ) -> Result<DownloadStats, Box<dyn std::error::Error>> {
-        download_himawari_files_streaming_multi_thread(
-            download_list,
-            vec![band.to_string()],
-            num_threads,
-            host,
-            username,
-            password,
-            local_storage,
-        )
-    }
-
-    /// 下载可见光波段（B01-B03）的流式函数
+    /// 下载可见光波段的FLDK文件
     pub fn download_visible_bands_streaming(
         download_list: Vec<NaiveDateTime>,
         num_threads: usize,
@@ -443,19 +427,11 @@ pub mod download_files {
         password: &str,
         local_storage: LocalFileStorage,
     ) -> Result<DownloadStats, Box<dyn std::error::Error>> {
-        // 可见光波段：B01(0.47μm), B02(0.51μm), B03(0.64μm)
-        let visible_bands = vec![
-            "B01".to_string(), // 蓝色波段 (0.47 μm)
-            "B02".to_string(), // 绿色波段 (0.51 μm)
-            "B03".to_string(), // 红色波段 (0.64 μm)
-        ];
+        let visible_bands = vec!["B01".to_string(), "B02".to_string(), "B03".to_string()];
 
-        println!("开始下载可见光波段 (B01-B03)");
-        println!("B01: 蓝色波段 (0.47 μm)");
-        println!("B02: 绿色波段 (0.51 μm)");
-        println!("B03: 红色波段 (0.64 μm)");
+        println!("开始下载可见光波段FLDK文件 (B01-B03)");
 
-        download_himawari_files_streaming_multi_thread(
+        download_fldk_files_streaming(
             download_list,
             visible_bands,
             num_threads,
@@ -466,8 +442,8 @@ pub mod download_files {
         )
     }
 
-    /// 下载近红外波段（B04-B06）的流式函数
-    pub fn download_near_infrared_bands_streaming(
+    /// 下载所有波段的FLDK文件
+    pub fn download_all_bands_streaming(
         download_list: Vec<NaiveDateTime>,
         num_threads: usize,
         host: &str,
@@ -475,21 +451,11 @@ pub mod download_files {
         password: &str,
         local_storage: LocalFileStorage,
     ) -> Result<DownloadStats, Box<dyn std::error::Error>> {
-        // 近红外波段：B04(0.86μm), B05(1.6μm), B06(2.3μm)
-        let near_infrared_bands = vec![
-            "B04".to_string(), // 近红外波段 (0.86 μm)
-            "B05".to_string(), // 短波红外波段 (1.6 μm)
-            "B06".to_string(), // 短波红外波段 (2.3 μm)
-        ];
+        println!("开始下载所有波段FLDK文件");
 
-        println!("开始下载近红外波段 (B04-B06)");
-        println!("B04: 近红外波段 (0.86 μm)");
-        println!("B05: 短波红外波段 (1.6 μm)");
-        println!("B06: 短波红外波段 (2.3 μm)");
-
-        download_himawari_files_streaming_multi_thread(
+        download_fldk_files_streaming(
             download_list,
-            near_infrared_bands,
+            vec![], // 空列表表示下载所有文件
             num_threads,
             host,
             username,
@@ -498,83 +464,21 @@ pub mod download_files {
         )
     }
 
-    /// 下载红外波段（B07-B16）的流式函数
-    pub fn download_infrared_bands_streaming(
+    /// 下载单个波段的FLDK文件
+    pub fn download_single_band_streaming(
         download_list: Vec<NaiveDateTime>,
+        band: &str,
         num_threads: usize,
         host: &str,
         username: &str,
         password: &str,
         local_storage: LocalFileStorage,
     ) -> Result<DownloadStats, Box<dyn std::error::Error>> {
-        // 红外波段：B07-B16
-        let infrared_bands = vec![
-            "B07".to_string(), // 短波红外波段 (3.9 μm)
-            "B08".to_string(), // 水蒸气波段 (6.2 μm)
-            "B09".to_string(), // 水蒸气波段 (6.9 μm)
-            "B10".to_string(), // 水蒸气波段 (7.3 μm)
-            "B11".to_string(), // 云顶温度波段 (8.6 μm)
-            "B12".to_string(), // 臭氧波段 (9.6 μm)
-            "B13".to_string(), // 清洁长波红外波段 (10.4 μm)
-            "B14".to_string(), // 长波红外波段 (11.2 μm)
-            "B15".to_string(), // 长波红外波段 (12.4 μm)
-            "B16".to_string(), // 脏长波红外波段 (13.3 μm)
-        ];
+        println!("开始下载波段 {} 的FLDK文件", band);
 
-        println!("开始下载红外波段 (B07-B16)");
-
-        download_himawari_files_streaming_multi_thread(
+        download_fldk_files_streaming(
             download_list,
-            infrared_bands,
-            num_threads,
-            host,
-            username,
-            password,
-            local_storage,
-        )
-    }
-
-    /// 下载真彩色RGB所需的波段（B01, B02, B03）
-    pub fn download_true_color_bands_streaming(
-        download_list: Vec<NaiveDateTime>,
-        num_threads: usize,
-        host: &str,
-        username: &str,
-        password: &str,
-        local_storage: LocalFileStorage,
-    ) -> Result<DownloadStats, Box<dyn std::error::Error>> {
-        println!("开始下载真彩色RGB波段 (B01, B02, B03)");
-        download_visible_bands_streaming(
-            download_list,
-            num_threads,
-            host,
-            username,
-            password,
-            local_storage,
-        )
-    }
-
-    /// 下载自然彩色RGB所需的波段（B01, B02, B03, B04）
-    pub fn download_natural_color_bands_streaming(
-        download_list: Vec<NaiveDateTime>,
-        num_threads: usize,
-        host: &str,
-        username: &str,
-        password: &str,
-        local_storage: LocalFileStorage,
-    ) -> Result<DownloadStats, Box<dyn std::error::Error>> {
-        let natural_color_bands = vec![
-            "B01".to_string(), // 蓝色
-            "B02".to_string(), // 绿色
-            "B03".to_string(), // 红色
-            "B04".to_string(), // 近红外
-        ];
-
-        println!("开始下载自然彩色RGB波段 (B01-B04)");
-
-        download_himawari_files_streaming_multi_thread(
-            download_list,
-            natural_color_bands,
+            vec![band.to_string()],
             num_threads,
             host,
             username,

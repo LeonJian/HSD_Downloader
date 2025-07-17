@@ -69,8 +69,7 @@ fn main() {
 
     // 创建本地存储配置
     let storage = LocalFileStorage::new(&config.download.base_path)
-        .with_time_organization(config.download.organize_by_time)
-        .with_original_structure(config.download.keep_original_structure);
+        .with_time_organization(config.download.organize_by_time);
 
     // 执行下载
     println!("开始下载可见光波段数据...");
