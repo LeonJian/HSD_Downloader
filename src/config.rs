@@ -82,7 +82,7 @@ impl Config {
         io::stdin().read_line(&mut host)?;
         let host = host.trim().to_string();
 
-        print!("请输入端口号 [22]: ");
+        print!("请输入端口号 [2051]: ");
         io::stdout().flush()?;
         let mut port_input = String::new();
         io::stdin().read_line(&mut port_input)?;
