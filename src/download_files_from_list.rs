@@ -1,18 +1,43 @@
 pub mod download_files {
     use chrono::NaiveDateTime;
     use ssh2::Session;
-    use std::fs::{self, File};
-    use std::io::{Read, Write};
+    use std::collections::HashSet;
+    use std::fs::{self, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::TcpStream;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// 下载状态
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum DownloadStatus {
+        NotStarted,
+        Downloading,
+        Completed,
+        Failed,
+    }
+
+    /// 文件下载记录
+    #[derive(Debug, Clone)]
+    pub struct FileDownloadRecord {
+        pub remote_path: String,
+        pub local_path: PathBuf,
+        pub temp_path: PathBuf,
+        pub expected_size: Option<u64>,
+        pub downloaded_size: u64,
+        pub status: DownloadStatus,
+        pub retry_count: usize,
+        pub last_modified: Option<String>,
+    }
 
     /// 本地文件存储结构
     #[derive(Debug, Clone)]
     pub struct LocalFileStorage {
         pub base_path: PathBuf,
         pub organize_by_time: bool,
+        pub temp_suffix: String,
     }
 
     impl LocalFileStorage {
@@ -20,11 +45,17 @@ pub mod download_files {
             Self {
                 base_path: PathBuf::from(base_path),
                 organize_by_time: true,
+                temp_suffix: ".downloading".to_string(),
             }
         }
 
         pub fn with_time_organization(mut self, organize_by_time: bool) -> Self {
             self.organize_by_time = organize_by_time;
+            self
+        }
+
+        pub fn with_temp_suffix(mut self, suffix: &str) -> Self {
+            self.temp_suffix = suffix.to_string();
             self
         }
 
@@ -48,6 +79,104 @@ pub mod download_files {
             }
 
             self.base_path.join(filename.as_ref())
+        }
+
+        /// 生成临时文件路径
+        pub fn generate_temp_path(&self, local_path: &Path) -> PathBuf {
+            let mut temp_path = local_path.to_path_buf();
+            let mut filename = temp_path.file_name().unwrap().to_string_lossy().to_string();
+            filename.push_str(&self.temp_suffix);
+            temp_path.set_file_name(filename);
+            temp_path
+        }
+
+        /// 清理未完成的下载文件
+        pub fn cleanup_incomplete_downloads(
+            &self,
+        ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+            let mut incomplete_files = Vec::new();
+            self.cleanup_directory(&self.base_path, &mut incomplete_files)?;
+
+            if !incomplete_files.is_empty() {
+                println!("发现 {} 个未完成的下载文件:", incomplete_files.len());
+                for file in &incomplete_files {
+                    println!("  删除: {}", file.display());
+                    if let Err(e) = fs::remove_file(file) {
+                        eprintln!("删除文件失败 {}: {}", file.display(), e);
+                    }
+                }
+            }
+
+            Ok(incomplete_files)
+        }
+
+        fn cleanup_directory(
+            &self,
+            dir: &Path,
+            incomplete_files: &mut Vec<PathBuf>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            if !dir.exists() {
+                return Ok(());
+            }
+
+            let entries = fs::read_dir(dir)?;
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+
+                if path.is_dir() {
+                    self.cleanup_directory(&path, incomplete_files)?;
+                } else if let Some(filename) = path.file_name() {
+                    let filename_str = filename.to_string_lossy();
+                    if filename_str.ends_with(&self.temp_suffix) {
+                        incomplete_files.push(path);
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        /// 检查波段数据完整性
+        pub fn check_band_completeness(
+            &self,
+            download_list: &[NaiveDateTime],
+            bands: &[String],
+        ) -> BandCompletenessReport {
+            let mut report = BandCompletenessReport::new();
+
+            for datetime in download_list {
+                let mut time_report = TimeSlotReport {
+                    datetime: *datetime,
+                    bands: Vec::new(),
+                };
+
+                for band in bands {
+                    let expected_filename = format!(
+                        "HS_H09_{}_FLDK_R05_S0101.DAT.bz2",
+                        format!("{}{}", datetime.format("%Y%m%d_%H%M"), band)
+                    );
+
+                    let local_path = self.generate_local_path(&expected_filename);
+                    let exists = local_path.exists();
+                    let size = if exists {
+                        fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                    time_report.bands.push(BandStatus {
+                        band: band.clone(),
+                        exists,
+                        size,
+                        path: local_path,
+                    });
+                }
+
+                report.time_slots.push(time_report);
+            }
+
+            report
         }
 
         fn parse_filename(&self, filename: &str) -> Option<FilenameParts> {
@@ -78,13 +207,56 @@ pub mod download_files {
         hour: String,
     }
 
+    /// 波段状态
+    #[derive(Debug, Clone)]
+    pub struct BandStatus {
+        pub band: String,
+        pub exists: bool,
+        pub size: u64,
+        pub path: PathBuf,
+    }
+
+    /// 时间段报告
+    #[derive(Debug, Clone)]
+    pub struct TimeSlotReport {
+        pub datetime: NaiveDateTime,
+        pub bands: Vec<BandStatus>,
+    }
+
+    /// 波段完整性报告
+    #[derive(Debug, Clone)]
+    pub struct BandCompletenessReport {
+        pub time_slots: Vec<TimeSlotReport>,
+    }
+
+    impl BandCompletenessReport {
+        pub fn new() -> Self {
+            Self {
+                time_slots: Vec::new(),
+            }
+        }
+
+        pub fn print_report(&self) {
+            println!("=== 波段数据完整性报告 ===");
+            for slot in &self.time_slots {
+                println!("时间: {}", slot.datetime.format("%Y-%m-%d %H:%M"));
+                for band in &slot.bands {
+                    let status = if band.exists { "✓" } else { "✗" };
+                    println!("  {} {}: {} bytes", status, band.band, band.size);
+                }
+            }
+        }
+    }
+
     /// 下载统计信息
     #[derive(Debug, Clone)]
     pub struct DownloadStats {
         pub total_files: usize,
         pub downloaded_files: usize,
         pub failed_files: usize,
+        pub skipped_files: usize,
         pub total_bytes: u64,
+        pub elapsed_time: Duration,
     }
 
     impl DownloadStats {
@@ -93,99 +265,162 @@ pub mod download_files {
                 total_files: 0,
                 downloaded_files: 0,
                 failed_files: 0,
+                skipped_files: 0,
                 total_bytes: 0,
+                elapsed_time: Duration::from_secs(0),
+            }
+        }
+
+        pub fn print_summary(&self) {
+            println!("=== 下载统计摘要 ===");
+            println!("总文件数: {}", self.total_files);
+            println!("成功下载: {}", self.downloaded_files);
+            println!("跳过文件: {}", self.skipped_files);
+            println!("失败文件: {}", self.failed_files);
+            println!("总下载量: {} MB", self.total_bytes / 1024 / 1024);
+            println!("耗时: {:?}", self.elapsed_time);
+            if self.elapsed_time.as_secs() > 0 {
+                let speed =
+                    self.total_bytes as f64 / self.elapsed_time.as_secs_f64() / 1024.0 / 1024.0;
+                println!("平均速度: {:.2} MB/s", speed);
             }
         }
     }
 
-    /// 先下载到内存，确认完毕后再保存到磁盘
-    fn download_and_save_file(
-        sftp: &ssh2::Sftp,
-        remote_path: &str,
-        local_storage: &LocalFileStorage,
-    ) -> Result<u64, Box<dyn std::error::Error>> {
-        println!("正在下载: {}", remote_path);
-
-        let local_path = local_storage.generate_local_path(remote_path);
-
-        // 检查文件是否已经存在
-        if local_path.exists() {
-            println!("文件已存在，跳过: {}", local_path.display());
-            return Ok(0);
-        }
-
-        // 第一步：先下载到内存
-        let mut remote_file = sftp.open(Path::new(remote_path))?;
-        let mut buffer = Vec::new();
-
-        // 读取整个文件到内存
-        remote_file.read_to_end(&mut buffer)?;
-        let total_bytes = buffer.len() as u64;
-
-        println!(
-            "文件已完全下载到内存: {} ({} 字节)",
-            remote_path, total_bytes
-        );
-
-        // 第二步：确认下载完毕后，创建目录并保存到磁盘
-        if let Some(parent) = local_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // 一次性写入磁盘
-        let mut local_file = File::create(&local_path)?;
-        local_file.write_all(&buffer)?;
-        local_file.flush()?;
-
-        println!("完成保存: {} ({} 字节)", local_path.display(), total_bytes);
-
-        Ok(total_bytes)
-    }
-
-    /// 流式下载版本（可选用）- 边下载边写入磁盘
-    #[allow(dead_code)]
+    /// 边下载边写入磁盘的安全版本
     fn download_and_save_file_streaming(
         sftp: &ssh2::Sftp,
         remote_path: &str,
         local_storage: &LocalFileStorage,
+        max_retries: usize,
     ) -> Result<u64, Box<dyn std::error::Error>> {
-        println!("正在流式下载: {}", remote_path);
-
         let local_path = local_storage.generate_local_path(remote_path);
+        let temp_path = local_storage.generate_temp_path(&local_path);
 
-        // 检查文件是否已经存在
+        // 检查文件是否已经存在并且完整
         if local_path.exists() {
-            println!("文件已存在，跳过: {}", local_path.display());
-            return Ok(0);
+            let local_size = fs::metadata(&local_path)?.len();
+            if local_size > 0 {
+                println!(
+                    "文件已存在，跳过: {} ({} bytes)",
+                    local_path.display(),
+                    local_size
+                );
+                return Ok(0);
+            }
         }
 
+        // 创建目录
         if let Some(parent) = local_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let mut remote_file = sftp.open(Path::new(remote_path))?;
-        let mut local_file = File::create(&local_path)?;
+        let mut retry_count = 0;
+        let mut last_error = None;
 
-        let mut buffer = [0; 8192];
-        let mut total_bytes = 0u64;
-
-        loop {
-            let bytes_read = remote_file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
+        while retry_count <= max_retries {
+            match download_file_with_resume(sftp, remote_path, &temp_path, &local_path) {
+                Ok(bytes) => {
+                    println!("完成下载: {} ({} bytes)", local_path.display(), bytes);
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    retry_count += 1;
+                    if retry_count <= max_retries {
+                        println!(
+                            "下载失败，重试 {}/{}: {}",
+                            retry_count, max_retries, remote_path
+                        );
+                        thread::sleep(Duration::from_secs(2));
+                    }
+                }
             }
-
-            local_file.write_all(&buffer[..bytes_read])?;
-            total_bytes += bytes_read as u64;
         }
 
-        local_file.flush()?;
+        Err(format!("下载失败，已重试 {} 次: {:?}", max_retries, last_error).into())
+    }
 
-        println!(
-            "完成流式下载: {} ({} 字节)",
-            local_path.display(),
-            total_bytes
-        );
+    /// 支持断点续传的下载函数
+    fn download_file_with_resume(
+        sftp: &ssh2::Sftp,
+        remote_path: &str,
+        temp_path: &Path,
+        final_path: &Path,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        // 获取远程文件信息
+        let remote_stat = sftp.stat(Path::new(remote_path))?;
+        let remote_size = remote_stat.size.unwrap_or(0);
+
+        // 检查是否存在临时文件
+        let mut start_pos = 0u64;
+        if temp_path.exists() {
+            let temp_size = fs::metadata(temp_path)?.len();
+            if temp_size < remote_size {
+                start_pos = temp_size;
+                println!("断点续传: {} (从 {} 字节开始)", remote_path, start_pos);
+            } else {
+                fs::remove_file(temp_path)?;
+            }
+        }
+
+        // 打开远程文件
+        let mut remote_file = sftp.open(Path::new(remote_path))?;
+        if start_pos > 0 {
+            remote_file.seek(SeekFrom::Start(start_pos))?;
+        }
+
+        // 打开本地临时文件
+        let mut local_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(start_pos > 0)
+            .truncate(start_pos == 0)
+            .open(temp_path)?;
+
+        // 使用缓冲区进行流式传输
+        let mut buffer = [0u8; 32768]; // 32KB 缓冲区
+        let mut total_bytes = start_pos;
+        let mut last_report_time = Instant::now();
+
+        loop {
+            match remote_file.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(bytes_read) => {
+                    local_file.write_all(&buffer[..bytes_read])?;
+                    total_bytes += bytes_read as u64;
+
+                    // 定期报告进度
+                    if last_report_time.elapsed() > Duration::from_secs(5) {
+                        let progress = (total_bytes as f64 / remote_size as f64) * 100.0;
+                        println!(
+                            "下载进度: {:.1}% ({}/{} bytes)",
+                            progress, total_bytes, remote_size
+                        );
+                        last_report_time = Instant::now();
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("读取远程文件失败: {}", e).into());
+                }
+            }
+        }
+
+        // 确保数据写入磁盘
+        local_file.flush()?;
+        local_file.sync_all()?;
+
+        // 验证文件大小
+        if total_bytes != remote_size {
+            return Err(format!(
+                "文件大小不匹配: 预期 {} 字节，实际 {} 字节",
+                remote_size, total_bytes
+            )
+            .into());
+        }
+
+        // 将临时文件移动到最终位置
+        fs::rename(temp_path, final_path)?;
 
         Ok(total_bytes)
     }
@@ -201,7 +436,6 @@ pub mod download_files {
 
         // 读取目录内容
         let dir_entries = sftp.readdir(Path::new(remote_dir))?;
-
         let target_datetime_str = target_time.format("%Y%m%d_%H%M").to_string();
 
         for (path, _stat) in dir_entries {
@@ -230,19 +464,20 @@ pub mod download_files {
             "/jma/hsd/{}/{}/{}/",
             datetime.format("%Y%m"), // 202507
             datetime.format("%d"),   // 17
-            datetime.format("%H")
-        ) // 09
+            datetime.format("%H")    // 09
+        )
     }
 
-    /// 收集所有要下载的文件列表
-    fn collect_all_files(
+    /// 收集所有要下载的文件列表并过滤已存在的文件
+    fn collect_files_to_download(
         download_list: &[NaiveDateTime],
         bands: &[String],
         host: &str,
         username: &str,
         password: &str,
+        local_storage: &LocalFileStorage,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        println!("开始收集所有需要下载的文件列表...");
+        println!("开始收集需要下载的文件列表...");
 
         // 建立连接
         let tcp = TcpStream::connect(host)?;
@@ -252,7 +487,8 @@ pub mod download_files {
         sess.userauth_password(username, password)?;
         let sftp = sess.sftp()?;
 
-        let mut all_files = Vec::new();
+        let mut files_to_download = Vec::new();
+        let mut existing_files = HashSet::new();
 
         for datetime in download_list {
             let remote_dir = get_remote_directory_path(datetime);
@@ -260,7 +496,22 @@ pub mod download_files {
             match list_fldk_files_in_directory(&sftp, &remote_dir, datetime, bands) {
                 Ok(files) => {
                     println!("在 {} 找到 {} 个文件", remote_dir, files.len());
-                    all_files.extend(files);
+
+                    for file in files {
+                        let local_path = local_storage.generate_local_path(&file);
+
+                        // 检查文件是否已存在且完整
+                        if local_path.exists() {
+                            if let Ok(metadata) = fs::metadata(&local_path) {
+                                if metadata.len() > 0 {
+                                    existing_files.insert(file);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        files_to_download.push(file);
+                    }
                 }
                 Err(e) => {
                     eprintln!("读取目录失败 {}: {}", remote_dir, e);
@@ -268,8 +519,10 @@ pub mod download_files {
             }
         }
 
-        println!("总共收集到 {} 个文件待下载", all_files.len());
-        Ok(all_files)
+        println!("已存在文件: {} 个", existing_files.len());
+        println!("需要下载: {} 个", files_to_download.len());
+
+        Ok(files_to_download)
     }
 
     /// 多线程流式下载FLDK文件 - 优化版
@@ -282,9 +535,25 @@ pub mod download_files {
         password: &str,
         local_storage: LocalFileStorage,
     ) -> Result<DownloadStats, Box<dyn std::error::Error>> {
+        let start_time = Instant::now();
+
         if download_list.is_empty() {
             println!("下载列表为空，跳过下载");
             return Ok(DownloadStats::new());
+        }
+
+        // 清理未完成的下载
+        println!("清理未完成的下载文件...");
+        let cleanup_result = local_storage.cleanup_incomplete_downloads()?;
+        if !cleanup_result.is_empty() {
+            println!("已清理 {} 个未完成的下载文件", cleanup_result.len());
+        }
+
+        // 检查波段数据完整性
+        if !bands.is_empty() {
+            println!("检查波段数据完整性...");
+            let report = local_storage.check_band_completeness(&download_list, &bands);
+            report.print_report();
         }
 
         if !bands.is_empty() {
@@ -295,23 +564,30 @@ pub mod download_files {
 
         println!("准备下载 {} 个时间点的FLDK数据", download_list.len());
 
-        // 第一步：收集所有要下载的文件
-        let all_files = collect_all_files(&download_list, &bands, host, username, password)?;
+        // 收集需要下载的文件
+        let files_to_download = collect_files_to_download(
+            &download_list,
+            &bands,
+            host,
+            username,
+            password,
+            &local_storage,
+        )?;
 
-        if all_files.is_empty() {
-            println!("没有找到符合条件的文件");
+        if files_to_download.is_empty() {
+            println!("没有需要下载的文件");
             return Ok(DownloadStats::new());
         }
 
-        // 第二步：将文件分配给线程
-        let files_per_thread = (all_files.len() + num_threads - 1) / num_threads;
+        // 将文件分配给线程
+        let files_per_thread = (files_to_download.len() + num_threads - 1) / num_threads;
         let mut distributed_files = Vec::new();
 
         for i in 0..num_threads {
             let start = i * files_per_thread;
-            let end = ((i + 1) * files_per_thread).min(all_files.len());
-            if start < all_files.len() {
-                distributed_files.push(all_files[start..end].to_vec());
+            let end = ((i + 1) * files_per_thread).min(files_to_download.len());
+            if start < files_to_download.len() {
+                distributed_files.push(files_to_download[start..end].to_vec());
             }
         }
 
@@ -369,10 +645,14 @@ pub mod download_files {
 
                 // 下载分配给该线程的所有文件
                 for file_path in file_list {
-                    match download_and_save_file(&sftp, &file_path, &storage_clone) {
+                    match download_and_save_file_streaming(&sftp, &file_path, &storage_clone, 3) {
                         Ok(bytes) => {
-                            thread_stats.downloaded_files += 1;
-                            thread_stats.total_bytes += bytes;
+                            if bytes > 0 {
+                                thread_stats.downloaded_files += 1;
+                                thread_stats.total_bytes += bytes;
+                            } else {
+                                thread_stats.skipped_files += 1;
+                            }
                         }
                         Err(e) => {
                             eprintln!("线程 {} 下载失败 {}: {}", thread_id, file_path, e);
@@ -382,9 +662,10 @@ pub mod download_files {
                 }
 
                 println!(
-                    "线程 {} 完成，成功: {}, 失败: {}, 总字节: {}",
+                    "线程 {} 完成，成功: {}, 跳过: {}, 失败: {}, 总字节: {}",
                     thread_id,
                     thread_stats.downloaded_files,
+                    thread_stats.skipped_files,
                     thread_stats.failed_files,
                     thread_stats.total_bytes
                 );
@@ -393,6 +674,7 @@ pub mod download_files {
                 let mut total_stats = stats_clone.lock().unwrap();
                 total_stats.total_files += thread_stats.total_files;
                 total_stats.downloaded_files += thread_stats.downloaded_files;
+                total_stats.skipped_files += thread_stats.skipped_files;
                 total_stats.failed_files += thread_stats.failed_files;
                 total_stats.total_bytes += thread_stats.total_bytes;
             });
@@ -407,13 +689,10 @@ pub mod download_files {
                 .map_err(|e| format!("线程加入失败: {:?}", e))?;
         }
 
-        let final_stats = Arc::try_unwrap(total_stats).unwrap().into_inner().unwrap();
+        let mut final_stats = Arc::try_unwrap(total_stats).unwrap().into_inner().unwrap();
+        final_stats.elapsed_time = start_time.elapsed();
 
-        println!("下载完成统计:");
-        println!("  总文件数: {}", final_stats.total_files);
-        println!("  成功下载: {}", final_stats.downloaded_files);
-        println!("  失败文件: {}", final_stats.failed_files);
-        println!("  总字节数: {}", final_stats.total_bytes);
+        final_stats.print_summary();
 
         Ok(final_stats)
     }
