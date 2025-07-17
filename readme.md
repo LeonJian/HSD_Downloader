@@ -279,18 +279,6 @@ cargo build --release
 4. 推送到分支 (`git push origin feature/AmazingFeature`)
 5. 创建Pull Request
 
-### 代码风格
-项目遵循Rust官方代码风格指南：
-``` bash
-# 格式化代码
-cargo fmt
-
-# 检查代码
-cargo clippy
-
-# 运行所有检查
-cargo fmt && cargo clippy && cargo test
-```
 ### 相关信息
 **注意**: 请确保您有合法的权限访问Himawari HSD数据服务器，并遵守相关的数据使用条款。
 
