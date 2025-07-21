@@ -1,3 +1,5 @@
+[简体中文](#https://github.com/LeonJian/HSD_Downloader/blob/master/readme_CN.md)
+[English](#https://github.com/LeonJian/HSD_Downloader/blob/master/readme.md)
 # Himawari HSD Data Downloader
 
 A multi-threaded Rust tool for downloading Himawari satellite HSD (Himawari Standard Data) data. This tool supports efficient batch downloading, resume capability, data integrity checking, and intelligent file organization.
